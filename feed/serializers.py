@@ -2,16 +2,45 @@ from rest_framework import serializers
 from django.contrib.auth.models import User
 from django.db.models import Count
 from django.db import IntegrityError
-from .models import Post, Comment, Like, KarmaTransaction
+from .models import Post, Comment, Like
 
 
+# --------------------------------------------------
+# USER
+# --------------------------------------------------
 
 class UserSerializer(serializers.ModelSerializer):
-    """Basic user serializer."""
-    
     class Meta:
         model = User
         fields = ['id', 'username']
+
+
+# --------------------------------------------------
+# HELPER FUNCTION (VERY IMPORTANT)
+# --------------------------------------------------
+
+def get_or_create_user(username):
+    """
+    Bulletproof username normalization.
+    Prevents:
+    - None.strip crash
+    - empty usernames
+    - case duplicates
+    """
+    if not username:
+        raise serializers.ValidationError({
+            "username": "Username is required."
+        })
+
+    username = username.strip().lower()
+
+    if username == "":
+        raise serializers.ValidationError({
+            "username": "Username cannot be empty."
+        })
+
+    user, _ = User.objects.get_or_create(username=username)
+    return user
 
 
 # --------------------------------------------------
@@ -19,18 +48,10 @@ class UserSerializer(serializers.ModelSerializer):
 # --------------------------------------------------
 
 class RecursiveCommentSerializer(serializers.Serializer):
-    """
-    Handles unlimited nested replies.
-
-    IMPORTANT:
-    Efficient only if the view prefetches replies.
-    """
-
     def to_representation(self, instance):
         serializer = CommentSerializer(
             instance,
-            context=self.context,
-            read_only=True
+            context=self.context
         )
         return serializer.data
 
@@ -40,12 +61,9 @@ class RecursiveCommentSerializer(serializers.Serializer):
 # --------------------------------------------------
 
 class CommentSerializer(serializers.ModelSerializer):
-    """
-    Nested comment serializer with like count.
-    """
 
     author = UserSerializer(read_only=True)
-    author_name = serializers.CharField(write_only=True, required=True)
+    author_name = serializers.CharField(write_only=True)
 
     like_count = serializers.IntegerField(read_only=True)
     replies = RecursiveCommentSerializer(many=True, read_only=True)
@@ -63,40 +81,25 @@ class CommentSerializer(serializers.ModelSerializer):
             'like_count',
             'replies'
         ]
-        read_only_fields = [
-            'created_at',
-            'like_count',
-            'author'
-        ]
+        read_only_fields = ['author', 'created_at', 'like_count']
 
     def create(self, validated_data):
-        """
-        Normalize username to avoid duplicates like:
-        'Alex' vs 'alex'
-        """
-        author_name = validated_data.pop('author_name').strip().lower()
 
-        author, _ = User.objects.get_or_create(
-            username=author_name
-        )
+        username = validated_data.pop('author_name')
+        user = get_or_create_user(username)
 
-        validated_data['author'] = author
+        validated_data['author'] = user
         return super().create(validated_data)
 
 
 # --------------------------------------------------
-# POST SERIALIZER (WITH NESTED COMMENTS)
+# POST SERIALIZER
 # --------------------------------------------------
 
 class PostSerializer(serializers.ModelSerializer):
-    """
-    Full post serializer including nested comments.
-
-    SAFE only when comments are prefetched in the view.
-    """
 
     author = UserSerializer(read_only=True)
-    author_name = serializers.CharField(write_only=True, required=True)
+    author_name = serializers.CharField(write_only=True)
 
     like_count = serializers.IntegerField(read_only=True)
     comments = serializers.SerializerMethodField()
@@ -112,62 +115,34 @@ class PostSerializer(serializers.ModelSerializer):
             'like_count',
             'comments'
         ]
-        read_only_fields = [
-            'created_at',
-            'like_count',
-            'author'
-        ]
+        read_only_fields = ['author', 'created_at', 'like_count']
 
     def get_comments(self, obj):
-        """
-        Return ONLY top-level comments.
-        Replies handled recursively.
-        """
 
-        # If view attached prefetched comments
-        if hasattr(obj, 'all_comments'):
-            top_level = [
-                c for c in obj.all_comments
-                if c.parent_id is None
-            ]
-
-        else:
-            # fallback (for create/update responses)
-            top_level = obj.comments.filter(
-                parent=None
-            ).select_related(
-                'author'
-            ).annotate(
-                like_count=Count('likes')
-            )
+        comments = obj.comments.filter(parent=None)\
+            .select_related('author')\
+            .annotate(like_count=Count('likes'))
 
         return CommentSerializer(
-            top_level,
+            comments,
             many=True,
             context=self.context
         ).data
 
     def create(self, validated_data):
 
-        author_name = validated_data.pop('author_name').strip().lower()
+        username = validated_data.pop('author_name')
+        user = get_or_create_user(username)
 
-        author, _ = User.objects.get_or_create(
-            username=author_name
-        )
-
-        validated_data['author'] = author
+        validated_data['author'] = user
         return super().create(validated_data)
 
 
 # --------------------------------------------------
-# LIGHTWEIGHT POST SERIALIZER (FEED VIEW)
+# LIGHTWEIGHT FEED SERIALIZER
 # --------------------------------------------------
 
 class PostListSerializer(serializers.ModelSerializer):
-    """
-    Lightweight serializer for feed.
-    No nested comments → faster response.
-    """
 
     author = UserSerializer(read_only=True)
     like_count = serializers.IntegerField(read_only=True)
@@ -181,10 +156,6 @@ class PostListSerializer(serializers.ModelSerializer):
             'created_at',
             'like_count'
         ]
-        read_only_fields = [
-            'created_at',
-            'like_count'
-        ]
 
 
 # --------------------------------------------------
@@ -192,11 +163,8 @@ class PostListSerializer(serializers.ModelSerializer):
 # --------------------------------------------------
 
 class LikeSerializer(serializers.ModelSerializer):
-    """
-    Prevents double likes using DB constraints.
-    """
 
-    user_name = serializers.CharField(write_only=True, required=True)
+    user_name = serializers.CharField(write_only=True)
 
     class Meta:
         model = Like
@@ -208,15 +176,10 @@ class LikeSerializer(serializers.ModelSerializer):
             'comment',
             'created_at'
         ]
-        read_only_fields = [
-            'user',
-            'created_at'
-        ]
+        read_only_fields = ['user', 'created_at']
 
     def validate(self, data):
-        """
-        Must like either post OR comment.
-        """
+
         if not data.get('post') and not data.get('comment'):
             raise serializers.ValidationError(
                 "Either post or comment must be provided."
@@ -224,18 +187,15 @@ class LikeSerializer(serializers.ModelSerializer):
 
         if data.get('post') and data.get('comment'):
             raise serializers.ValidationError(
-                "Cannot like both post and comment simultaneously."
+                "Cannot like both post and comment."
             )
 
         return data
 
     def create(self, validated_data):
 
-        user_name = validated_data.pop('user_name').strip().lower()
-
-        user, _ = User.objects.get_or_create(
-            username=user_name
-        )
+        username = validated_data.pop('user_name')
+        user = get_or_create_user(username)
 
         validated_data['user'] = user
 
@@ -244,7 +204,7 @@ class LikeSerializer(serializers.ModelSerializer):
 
         except IntegrityError:
             raise serializers.ValidationError(
-                "You have already liked this item."
+                "You already liked this."
             )
 
 
@@ -253,10 +213,6 @@ class LikeSerializer(serializers.ModelSerializer):
 # --------------------------------------------------
 
 class LeaderboardSerializer(serializers.Serializer):
-    """
-    Used for aggregated leaderboard query.
-    """
-
     id = serializers.IntegerField()
     username = serializers.CharField()
     karma_24h = serializers.IntegerField()
