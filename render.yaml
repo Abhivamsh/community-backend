@@ -1,0 +1,28 @@
+databases:
+  - name: playto-db
+    databaseName: playto
+    user: playto
+    plan: free
+
+services:
+  - type: web
+    name: playto-backend
+    runtime: python
+    plan: free
+    buildCommand: "./build.sh"
+    startCommand: "gunicorn community_feed.wsgi:application"
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: playto-db
+          property: connectionString
+      - key: SECRET_KEY
+        generateValue: true
+      - key: DEBUG
+        value: "False"
+      - key: ALLOWED_HOSTS
+        value: ".onrender.com"
+      - key: CORS_ALLOWED_ORIGINS
+        value: "https://your-frontend-url.onrender.com"
+      - key: PYTHON_VERSION
+        value: "3.11.0"
